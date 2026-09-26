@@ -150,7 +150,12 @@ def build_screening_agent() -> Agent:
     #
     # Hint: Use temperature=0.0 for deterministic classification
     # ───────────────────────────────────────────────────────
-    pass  # Replace with your implementation
+    model = BedrockModel(model_id=NOVA_LITE_MODEL, region_name=AWS_REGION, temperature=0.0)
+    system_prompt = """You are a content screening agent. Your ONLY job is a fast first-pass triage of a social media post.
+Call the screen_post tool with the post_id you are given.
+Then report in one line each: Classification (SAFE, HARMFUL, or BORDERLINE) and Confidence.
+Do not perform deep analysis or write moderation notices — just screen."""
+    return Agent(model=model, system_prompt=system_prompt, tools=[screen_post])
 
 
 # ═══════════════════════════════════════════════════════
@@ -203,7 +208,13 @@ def build_review_agent() -> Agent:
     #
     # Hint: Use temperature=0.1 for analytical consistency
     # ───────────────────────────────────────────────────────
-    pass  # Replace with your implementation
+    model = BedrockModel(model_id=CLAUDE_MODEL, region_name=AWS_REGION, temperature=0.1)
+    system_prompt = """You are a deep content review agent. Your ONLY job is to make a final call on a post that screening flagged as BORDERLINE.
+Call the deep_review_post tool with the post_id you are given.
+Weigh context such as satire, hyperbole, cultural nuance, and misinformation risk.
+Then report: Verdict (SAFE or HARMFUL) and a one-sentence Reason.
+Do not screen posts or draft notices — only deliver the verdict."""
+    return Agent(model=model, system_prompt=system_prompt, tools=[deep_review_post])
 
 
 # ═══════════════════════════════════════════════════════
@@ -251,7 +262,12 @@ def build_notice_agent() -> Agent:
     #
     # Hint: Use temperature=0.3 for slightly creative communication
     # ───────────────────────────────────────────────────────
-    pass  # Replace with your implementation
+    model = BedrockModel(model_id=NOVA_PRO_MODEL, region_name=AWS_REGION, temperature=0.3)
+    system_prompt = """You are a moderation notice agent. Your ONLY job is to communicate a moderation decision to the user.
+Call the generate_notice tool with the post_id and violation_type you are given.
+Then report: Action (REMOVED or FLAGGED), the Notice text, and the Reason.
+Write clearly and professionally; do not screen or review content yourself."""
+    return Agent(model=model, system_prompt=system_prompt, tools=[generate_notice])
 
 
 # ═══════════════════════════════════════════════════════
