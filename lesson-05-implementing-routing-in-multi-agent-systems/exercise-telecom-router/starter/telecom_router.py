@@ -77,6 +77,7 @@ def run_agent_with_retry(agent_builder, prompt: str, max_retries: int = 3) -> fl
             else:
                 print(f"    [Failed] {e.__class__.__name__} after {max_retries} attempts")
                 raise
+    raise RuntimeError("run_agent_with_retry: retry loop exhausted without returning")
 
 
 # ─────────────────────────────────────────────────────
@@ -186,7 +187,11 @@ worker_response = {}
 
 def priority_route(text: str) -> str | None:
     """Check if ticket contains cancellation intent."""
-    pass
+    pattern = (
+        r"\b(cancel\w*|switch provider|terminate|discontinue|done with this company"
+        r"|leave\s+(the\s+)?(provider|service|company|carrier|plan))\b"
+    )
+    return "RetentionAgent" if re.search(pattern, text.lower()) else None
 
 
 # TODO 2: Implement rule_based_route(text) — Billing & Technical Keywords
@@ -198,11 +203,18 @@ def priority_route(text: str) -> str | None:
 #   Match against text.lower() and return the first matching agent, or None.
 #   Hint: Same structure as the demo's ROUTING_RULES + rule_based_route()
 
-ROUTING_RULES = []  # Fill this in as part of TODO 2
+ROUTING_RULES = [
+    (r"\b(bill|charge|payment|invoice|subscription|rate|roaming)\w*", "BillingAgent"),
+    (r"\b(outage|no signal|slow|dropped|disconnect|no service|tower)\b", "TechnicalAgent"),
+]
 
 def rule_based_route(text: str) -> str | None:
     """Match ticket text against keyword rules."""
-    pass
+    lowered = text.lower()
+    for pattern, agent in ROUTING_RULES:
+        if re.search(pattern, lowered):
+            return agent
+    return None
 
 
 # TODO 3: Build the LLM classifier agent (STEP 1/2/3)
@@ -233,9 +245,17 @@ def build_classifier_agent() -> Agent:
         return json.dumps(classification_result, indent=2)
 
     # TODO 3a: Create BedrockModel (STEP 1)
+    model = BedrockModel(model_id=NOVA_LITE_MODEL, region_name=AWS_REGION, temperature=0.0)
+
     # TODO 3b: Write system prompt (STEP 2)
+    system_prompt = """You are a telecom support ticket classifier. Your ONLY job is to classify one ticket into a single intent.
+Call the classify_intent tool exactly once, passing:
+  - intent: one of billing, technical, cancellation, general
+  - confidence: your confidence from 0.0 to 1.0
+Use 'general' only when the ticket fits none of the others. Do not answer the ticket or take any other action."""
+
     # TODO 3c: Return Agent (STEP 3)
-    pass
+    return Agent(model=model, system_prompt=system_prompt, tools=[classify_intent])
 
 
 INTENT_TO_AGENT = {
@@ -317,9 +337,11 @@ def hybrid_route(ticket: dict) -> dict:
 def build_billing_agent() -> Agent:
     """Worker: Handles billing-related tickets."""
 
-    # TODO 4: Create BedrockModel (STEP 1)
-    # TODO 5: Write system prompt (STEP 2) — call handle_billing, report result
-    # TODO 6: Return Agent (STEP 3)
+    model = BedrockModel(model_id=NOVA_LITE_MODEL, region_name=AWS_REGION, temperature=0.3)
+    system_prompt = """You are a billing support agent. Your ONLY job is to resolve one billing ticket.
+Call the handle_billing tool with the ticket_id you are given.
+Then report the case_id, resolution, and status from the tool result.
+Do not handle technical, cancellation, or general tickets."""
 
     @tool
     def handle_billing(ticket_id: str) -> str:
@@ -336,15 +358,17 @@ def build_billing_agent() -> Agent:
         worker_response["result"] = result
         return json.dumps(result, indent=2)
 
-    pass
+    return Agent(model=model, system_prompt=system_prompt, tools=[handle_billing])
 
 
 def build_technical_agent() -> Agent:
     """Worker: Handles technical support tickets."""
 
-    # TODO 7: Create BedrockModel (STEP 1)
-    # TODO 8: Write system prompt (STEP 2) — call handle_technical, report result
-    # TODO 9: Return Agent (STEP 3)
+    model = BedrockModel(model_id=NOVA_LITE_MODEL, region_name=AWS_REGION, temperature=0.3)
+    system_prompt = """You are a technical support agent. Your ONLY job is to work one technical ticket.
+Call the handle_technical tool with the ticket_id you are given.
+Then report the case_id, resolution, and status from the tool result.
+Do not handle billing, cancellation, or general tickets."""
 
     @tool
     def handle_technical(ticket_id: str) -> str:
@@ -361,15 +385,17 @@ def build_technical_agent() -> Agent:
         worker_response["result"] = result
         return json.dumps(result, indent=2)
 
-    pass
+    return Agent(model=model, system_prompt=system_prompt, tools=[handle_technical])
 
 
 def build_retention_agent() -> Agent:
     """Worker: Handles cancellation requests (retention specialist)."""
 
-    # TODO 10: Create BedrockModel (STEP 1)
-    # TODO 11: Write system prompt (STEP 2) — call handle_retention, report result
-    # TODO 12: Return Agent (STEP 3)
+    model = BedrockModel(model_id=NOVA_LITE_MODEL, region_name=AWS_REGION, temperature=0.3)
+    system_prompt = """You are a retention specialist. Your ONLY job is to handle one cancellation request and present the retention offer.
+Call the handle_retention tool with the ticket_id you are given.
+Then report the offer, case_id, and status from the tool result.
+Do not handle billing, technical, or general tickets."""
 
     @tool
     def handle_retention(ticket_id: str) -> str:
@@ -384,15 +410,17 @@ def build_retention_agent() -> Agent:
         worker_response["result"] = result
         return json.dumps(result, indent=2)
 
-    pass
+    return Agent(model=model, system_prompt=system_prompt, tools=[handle_retention])
 
 
 def build_general_support_agent() -> Agent:
     """Worker: Fallback for unclassifiable tickets."""
 
-    # TODO 13: Create BedrockModel (STEP 1)
-    # TODO 14: Write system prompt (STEP 2) — call handle_general, report result
-    # TODO 15: Return Agent (STEP 3)
+    model = BedrockModel(model_id=NOVA_LITE_MODEL, region_name=AWS_REGION, temperature=0.3)
+    system_prompt = """You are a general support agent handling tickets that could not be classified. Your ONLY job is to log one ticket for human review.
+Call the handle_general tool with the ticket_id you are given.
+Then report the ticket_ref and status from the tool result.
+Do not attempt to resolve billing, technical, or cancellation issues yourself."""
 
     @tool
     def handle_general(ticket_id: str) -> str:
@@ -405,7 +433,7 @@ def build_general_support_agent() -> Agent:
         worker_response["result"] = result
         return json.dumps(result, indent=2)
 
-    pass
+    return Agent(model=model, system_prompt=system_prompt, tools=[handle_general])
 
 
 AGENT_BUILDERS = {
