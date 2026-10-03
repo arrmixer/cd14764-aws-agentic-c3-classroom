@@ -21,7 +21,7 @@ import sys
 from dotenv import load_dotenv
 
 load_dotenv()
-AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
+AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 
 DRUG_INTERACTIONS_KB = [
     {
