@@ -176,7 +176,21 @@ checkout_table = dynamodb.Table(CHECKOUT_SAGA_TABLE)
 #   - Return the record
 #   Hint: Same as demo's create_saga(), plus the barrier counter fields
 def create_saga(checkout_id: str, steps: list[str]) -> dict:
-    pass
+    record = {
+        "checkout_id": checkout_id,
+        "steps": [
+            {"name": name, "status": "pending", "forward_ref": None, "compensation_ref": None}
+            for name in steps
+        ],
+        "current_phase": 0,
+        "overall_status": "in_progress",
+        "locked": False,
+        "compensations_needed": 0,
+        "compensations_completed": 0,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    checkout_table.put_item(Item=to_dynamo(record))
+    return record
 
 
 # TODO 2: Implement update_step(checkout_id, step_index, updates)
@@ -184,22 +198,42 @@ def create_saga(checkout_id: str, steps: list[str]) -> dict:
 #   - Return updated saga
 #   Hint: Same as demo's update_step() — use checkout_table.get_item and put_item with to_dynamo/from_dynamo
 def update_step(checkout_id: str, step_index: int, updates: dict) -> dict:
-    pass
-
+    response = checkout_table.get_item(Key={"checkout_id": checkout_id})
+    saga = from_dynamo(response.get("Item"))
+    saga["steps"][step_index].update(updates)
+    saga["updated_at"] = datetime.now(timezone.utc).isoformat()
+    checkout_table.put_item(Item=to_dynamo(saga))
+    return saga
 
 # TODO 3: Implement acquire_lock(checkout_id) -> bool
 #   - Use checkout_table.update_item with ConditionExpression to set locked=True only if locked==False
 #   - Return True if acquired, False if ClientError with ConditionalCheckFailedException
 #   Hint: Same as demo's acquire_lock() — use UpdateExpression and ConditionExpression
 def acquire_lock(checkout_id: str) -> bool:
-    pass
+    try:
+        checkout_table.update_item(
+            Key={"checkout_id": checkout_id},
+            UpdateExpression="SET locked = :true_val",
+            ConditionExpression="locked = :false_val",
+            ExpressionAttributeValues={":true_val": True, ":false_val": False},
+        )
+        return True
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            print(f"      [Lock] Failed to acquire lock for {checkout_id} — already locked")
+            return False
+        raise
 
 
 # TODO 4: Implement release_lock(checkout_id)
 #   - Use checkout_table.update_item to set locked=False
 #   Hint: Same as demo's release_lock()
 def release_lock(checkout_id: str):
-    pass
+    checkout_table.update_item(
+        Key={"checkout_id": checkout_id},
+        UpdateExpression="SET locked = :false_val",
+        ExpressionAttributeValues={":false_val": False},
+    )
 
 
 # TODO 5: Implement increment_barrier(checkout_id) -> tuple[int, int]
@@ -208,7 +242,14 @@ def release_lock(checkout_id: str):
 #   Hint: NEW pattern. Barrier ensures saga doesn't resolve until all compensations finish.
 #         Use ADD expression for atomic counter, ReturnValues="ALL_NEW" to get updated item.
 def increment_barrier(checkout_id: str) -> tuple[int, int]:
-    pass
+    response = checkout_table.update_item(
+        Key={"checkout_id": checkout_id},
+        UpdateExpression="ADD compensations_completed :one",
+        ExpressionAttributeValues={":one": 1},
+        ReturnValues="ALL_NEW",
+    )
+    attrs = from_dynamo(response["Attributes"])
+    return int(attrs.get("compensations_completed", 0)), int(attrs.get("compensations_needed", 0))
 
 
 def get_saga(checkout_id: str) -> dict | None:
@@ -229,11 +270,14 @@ def build_inventory_agent(items: list, checkout_id: str,
                           cancel_mode: bool = False) -> Agent:
     """Agent for inventory reservation / release."""
     # TODO 6: Create BedrockModel with NOVA_LITE_MODEL, temperature=0.0
-    model = None  # Replace with BedrockModel(...)
+    model = BedrockModel(model_id=NOVA_LITE_MODEL, region_name=AWS_REGION, temperature=0.0)  # Replace with BedrockModel(...)
 
     if cancel_mode:
         # TODO 7: Write system prompt for inventory release
-        system_prompt = ""  # Replace with system prompt
+        system_prompt = f"""You are an inventory release agent. Your ONLY job:
+        1. Call release_items with checkout_id '{checkout_id}'
+        2. Report: Inventory released for {checkout_id}
+        Do NOT add any other commentary."""  # Replace with system prompt
 
         @tool
         def release_items(checkout_id: str) -> str:
@@ -267,7 +311,10 @@ def build_inventory_agent(items: list, checkout_id: str,
 
     else:
         # TODO 8: Write system prompt for inventory reservation
-        system_prompt = ""  # Replace with system prompt
+        system_prompt = f"""You are an inventory reservation agent. Your ONLY job:
+        1. Call reserve_items with checkout_id '{checkout_id}'
+        2. Report: Inventory reserved for {checkout_id}
+        Do NOT add any other commentary."""  # Replace with system prompt
 
         @tool
         def reserve_items(checkout_id: str) -> str:
@@ -305,11 +352,14 @@ def build_payment_agent(payment_data: dict, total: float, checkout_id: str,
                         cancel_mode: bool = False) -> Agent:
     """Agent for payment processing / refund."""
     # TODO 9: Create BedrockModel with NOVA_LITE_MODEL, temperature=0.0
-    model = None  # Replace with BedrockModel(...)
+    model = BedrockModel(model_id=NOVA_LITE_MODEL, region_name=AWS_REGION, temperature=0.0)  # Replace with BedrockModel(...)
 
     if cancel_mode:
         # TODO 10: Write system prompt for refund
-        system_prompt = ""  # Replace with system prompt
+        system_prompt = f"""You are a payment refund agent. Your ONLY job:
+        1. Call refund_card with checkout_id '{checkout_id}'
+        2. Report: Payment refunded for {checkout_id}
+        Do NOT add any other commentary."""  # Replace with system prompt
 
         @tool
         def refund_card(checkout_id: str) -> str:
@@ -342,7 +392,10 @@ def build_payment_agent(payment_data: dict, total: float, checkout_id: str,
 
     else:
         # TODO 11: Write system prompt for charge
-        system_prompt = ""  # Replace with system prompt
+        system_prompt = f"""You are a payment processing agent. Your ONLY job:
+1. Call charge_card with checkout_id '{checkout_id}'
+2. Report: Card charged for {checkout_id} OR Payment failed for {checkout_id}
+Do NOT add any other commentary."""  # Replace with system prompt
 
         @tool
         def charge_card(checkout_id: str) -> str:
@@ -388,11 +441,14 @@ def build_shipping_agent(shipping_data: dict, checkout_id: str,
                          cancel_mode: bool = False) -> Agent:
     """Agent for shipping scheduling / cancellation."""
     # TODO 12: Create BedrockModel with NOVA_LITE_MODEL, temperature=0.0
-    model = None  # Replace with BedrockModel(...)
+    model = BedrockModel(model_id=NOVA_LITE_MODEL, region_name=AWS_REGION, temperature=0.0)  # Replace with BedrockModel(...)
 
     if cancel_mode:
         # TODO 13: Write system prompt for delivery cancellation
-        system_prompt = ""  # Replace with system prompt
+        system_prompt = f"""You are a delivery cancellation agent. Your ONLY job:
+1. Call cancel_delivery with checkout_id '{checkout_id}'
+2. Report: Delivery cancelled for {checkout_id}
+Do NOT add any other commentary."""  # Replace with system prompt
 
         @tool
         def cancel_delivery(checkout_id: str) -> str:
@@ -423,7 +479,10 @@ def build_shipping_agent(shipping_data: dict, checkout_id: str,
 
     else:
         # TODO 14: Write system prompt for delivery scheduling
-        system_prompt = ""  # Replace with system prompt
+        system_prompt = f"""You are a delivery scheduling agent. Your ONLY job:
+1. Call schedule_delivery with checkout_id '{checkout_id}'
+2. Report: Delivery scheduled for {checkout_id} OR Delivery failed for {checkout_id}
+Do NOT add any other commentary."""  # Replace with system prompt
 
         @tool
         def schedule_delivery(checkout_id: str) -> str:
@@ -517,11 +576,45 @@ def run_checkout_saga(checkout: dict):
     #   Loop: update_step→executing, run_agent_with_retry, check status, break if failed
     #   Hint: Same pattern as demo's run_saga() forward execution
     failed_step = None
-    pass  # Replace with forward execution loop
+    for agent_config in agents_config:
+        name = agent_config["name"]
+        idx = agent_config["index"]
+
+        update_step(checkout_id, idx, {"status": "executing"})
+        checkout_table.update_item(
+            Key={"checkout_id": checkout_id},
+            UpdateExpression="SET current_phase = :val",
+            ExpressionAttributeValues={":val": idx},
+        )
+
+        print(f"\n  [{idx + 1}/3] {name.title()}Agent (forward)...")
+        try:
+            t = run_agent_with_retry(agent_config["builder"], agent_config["prompt"])
+        except Exception as e:
+            print(f"    AGENT ERROR: {e}")
+            update_step(checkout_id, idx, {"status": "failed"})
+            failed_step = idx
+            break
+
+        saga = get_saga(checkout_id)
+        if not saga:
+            raise KeyError(f"Saga {checkout_id} not found")
+        step = saga["steps"][idx]
+
+        if step["status"] == "failed":
+            print(f"    FAILED: {name} failed")
+            failed_step = idx
+            break
+        else:
+            print(f"    OK: {step.get('forward_ref', '?')} ({t:.1f}s)")  # Replace with forward execution loop
 
     saga = get_saga(checkout_id)
     if failed_step is None:
-        db.update_item("CheckoutSaga", checkout_id, {"overall_status": "completed"})
+        checkout_table.update_item(
+            Key={"checkout_id": checkout_id},
+            UpdateExpression="SET overall_status = :val",
+            ExpressionAttributeValues={":val": "completed"},
+        )
         print(f"\n  ✓ Checkout {checkout_id} COMPLETED — order confirmed!")
         return get_saga(checkout_id)
 
@@ -540,11 +633,69 @@ def run_checkout_saga(checkout: dict):
         "payment": f"Refund card for checkout {checkout_id}",
         "shipping": f"Cancel delivery for checkout {checkout_id}",
     }
-    pass  # Replace with compensation logic
+    print(f"\n  ✗ Step '{agents_config[failed_step]['name']}' failed — starting compensation...")
+    checkout_table.update_item(
+        Key={"checkout_id": checkout_id},
+        UpdateExpression="SET overall_status = :val",
+        ExpressionAttributeValues={":val": "compensating"},
+    )
+
+    print(f"  Acquiring compensation lock...")
+    if not acquire_lock(checkout_id):
+        print(f"  ERROR: Could not acquire lock — another compensator is running")
+        return get_saga(checkout_id)
+    print(f"    Lock acquired")
+
+    saga = get_saga(checkout_id)
+    if not saga:
+        raise KeyError(f"Saga {checkout_id} not found")
+    completed_steps = [
+        (i, s) for i, s in enumerate(saga["steps"])
+        if s["status"] == "completed"
+    ]
+    completed_steps.reverse()  # compensate last-completed first
+    print(f"  Compensating {len(completed_steps)} completed step(s) in reverse order...")
+
+    # Barrier target: set BEFORE running any compensation.
+    checkout_table.update_item(
+        Key={"checkout_id": checkout_id},
+        UpdateExpression="SET compensations_needed = :n, compensations_completed = :z",
+        ExpressionAttributeValues={":n": len(completed_steps), ":z": 0},
+    )
+
+    for idx, step in completed_steps:
+        name = step["name"]
+        update_step(checkout_id, idx, {"status": "compensating"})
+        print(f"\n  [COMPENSATE] {name.title()}Agent (cancel)...")
+        try:
+            t = run_agent_with_retry(compensation_builders[name], compensation_prompts[name])
+            saga_after = get_saga(checkout_id)
+            if not saga_after:
+                raise KeyError(f"Saga {checkout_id} not found")
+            comp_step = saga_after["steps"][idx]
+            print(f"    Compensated: {comp_step.get('compensation_ref', '?')} ({t:.1f}s)")
+        except Exception as e:
+            print(f"    COMPENSATION FAILED: {e}")
+
+    release_lock(checkout_id)
+    print(f"\n  Lock released")  # Replace with compensation logic
 
     # TODO 17: Barrier check — read saga, verify completed==needed, set status
     #   Hint: NEW pattern prevents premature resolution while compensations run
-    pass  # Replace with barrier check
+    saga_after = get_saga(checkout_id)
+    if not saga_after:
+        raise KeyError(f"Saga {checkout_id} not found")
+    done = int(saga_after.get("compensations_completed", 0))
+    needed = int(saga_after.get("compensations_needed", 0))
+    if done == needed and needed > 0:
+        checkout_table.update_item(
+            Key={"checkout_id": checkout_id},
+            UpdateExpression="SET overall_status = :val",
+            ExpressionAttributeValues={":val": "failed"},
+        )
+        print(f"  Barrier reached ({done}/{needed}) — saga resolved to 'failed'")
+    else:
+        print(f"  Barrier NOT reached ({done}/{needed}) — saga stays 'compensating' for operator review")  # Replace with barrier check
 
     return get_saga(checkout_id)
 
@@ -557,7 +708,32 @@ def main():
     print("  Saga Pattern with Compensating Transactions + Barrier")
     print("  3 Checkout Agents: Inventory → Payment → Shipping")
     print("=" * 70)
-    pass  # Replace with main scenario loop
+    results = []
+    for checkout in CHECKOUTS:
+        print(f"\n{'━' * 70}")
+        print(f"  {checkout['checkout_id']} — {checkout['customer']}")
+        for item in checkout["items"]:
+            print(f"    {item['name']} x{item['qty']} @ ${item['price']:.2f}")
+        if checkout["simulate_failure"]:
+            print(f"    ⚠ Failure scenario: {checkout['simulate_failure']} will fail")
+        print(f"{'━' * 70}")
+
+        result = run_checkout_saga(checkout)
+        results.append(result)
+
+        print(f"\n  Checkout {result['checkout_id']} | Status: {result['overall_status']}")
+        for step in result["steps"]:
+            ref = step.get("forward_ref") or "—"
+            comp = step.get("compensation_ref") or "—"
+            print(f"    {step['name']:<10} {step['status']:<14} fwd={ref:<22} comp={comp}")
+
+    print(f"\n{'═' * 70}")
+    print("  SAGA SUMMARY")
+    print(f"{'═' * 70}")
+    for result in results:
+        icon = "✓" if result["overall_status"] == "completed" else "✗"
+        compensated = sum(1 for s in result["steps"] if s["status"] == "compensated")
+        print(f"  {icon} {result['checkout_id']}: {result['overall_status']} ({compensated} compensated)")  # Replace with main scenario loop
 
 
 if __name__ == "__main__":
