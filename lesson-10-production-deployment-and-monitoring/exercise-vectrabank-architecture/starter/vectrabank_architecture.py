@@ -40,7 +40,32 @@ load_dotenv()
 #   - Environment variables: 3 KB IDs, state table, audit table, region, log level
 VECTRABANK_RUNTIME_CONFIG = {
     "agentRuntimeName": "vectrabank-financial-services",
-    # Replace with full config...
+    "description": "Multi-agent system for VectraBank financial services",
+    "roleArn": os.environ.get("AGENTCORE_ROLE_ARN", "<from-cf-exports>"),
+    # Financial services → internal-only, no public internet exposure
+    "networkConfiguration": {
+        "networkMode": "VPC",
+        "vpcConfiguration": {
+            "vpcId": "vpc-vectrabank",
+            "subnetIds": ["subnet-private-1a", "subnet-private-1b"],
+            "securityGroupIds": ["sg-vectrabank-agents"],
+        },
+    },
+    "protocolConfiguration": {"serverProtocol": "MCP"},
+    "guardrailConfiguration": {
+        "guardrailIdentifier": "gr-vectrabank-compliance",
+        "guardrailVersion": "1",
+    },
+    "environmentVariables": {
+        "MARKET_DATA_KB_ID": "KB-MARKET-001",
+        "COMPLIANCE_KB_ID": "KB-COMPLIANCE-002",
+        "RISK_ASSESSMENT_KB_ID": "KB-RISK-003",
+        "STATE_TABLE_NAME": "vectrabank-state",
+        "AUDIT_TABLE_NAME": "vectrabank-audit",
+        "AWS_REGION": os.environ.get("AWS_REGION", "us-east-1"),
+        "LOG_LEVEL": "INFO",
+        "ENVIRONMENT": "production",
+    },
 }
 
 
@@ -53,7 +78,42 @@ VECTRABANK_RUNTIME_CONFIG = {
 #       ComplianceRetriever (Nova Lite), FinancialAdvisor (Claude Sonnet)
 #   Each needs: name, model, temperature, role, tools, estimated_tokens, requests_per_day
 VECTRABANK_AGENTS = [
-    # Replace with 4 agent definitions...
+    {
+        "name": "QueryRouter",
+        "model": "amazon.nova-lite-v1:0",
+        "temperature": 0.0,
+        "role": "Route each client query to the correct specialist agent",
+        "tools": ["classify_query", "check_client_tier"],
+        "estimated_tokens_per_request": 500,
+        "requests_per_day": 10000,   # every request hits the router
+    },
+    {
+        "name": "MarketDataRetriever",
+        "model": "amazon.nova-lite-v1:0",
+        "temperature": 0.0,
+        "role": "Retrieve market data passages from the Market Data KB",
+        "tools": ["retrieve_market_data"],
+        "estimated_tokens_per_request": 800,
+        "requests_per_day": 6000,
+    },
+    {
+        "name": "ComplianceRetriever",
+        "model": "amazon.nova-lite-v1:0",
+        "temperature": 0.0,
+        "role": "Retrieve regulatory/compliance passages from the Compliance KB",
+        "tools": ["retrieve_compliance"],
+        "estimated_tokens_per_request": 800,
+        "requests_per_day": 6000,
+    },
+    {
+        "name": "FinancialAdvisor",
+        "model": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        "temperature": 0.1,
+        "role": "Synthesize a grounded, compliant financial recommendation with citations",
+        "tools": ["synthesize_advice"],
+        "estimated_tokens_per_request": 2500,
+        "requests_per_day": 4000,   # ~40% of queries need full synthesis
+    },
 ]
 
 
@@ -72,9 +132,37 @@ VECTRABANK_AGENTS = [
 # Hint: 10% sampling for financial audit, annotations for query_type, agent_name, etc.
 VECTRABANK_MONITORING = {
     "dashboard_name": "vectrabank-financial-services",
-    "widgets": [],   # Replace with 6 widget definitions
-    "alarms": [],    # Replace with 3 alarm definitions
-    "xray_tracing": {},  # Replace with tracing config
+    "widgets": [
+        {"title": "Total Queries", "type": "line", "metric": "AgentCore/Invocations",
+         "period": 60, "stat": "Sum"},
+        {"title": "Latency P50/P99", "type": "line",
+         "metrics": [{"name": "AgentCore/Latency", "stat": "p50"},
+                     {"name": "AgentCore/Latency", "stat": "p99"}], "period": 60},
+        {"title": "Error Rate", "type": "number", "metric": "AgentCore/Errors",
+         "period": 300, "stat": "Average", "threshold": 0.02},   # 2% — stricter for finance
+        {"title": "Guardrail Blocks by Type", "type": "stacked_bar",
+         "metrics": [{"name": "Guardrail/ContentBlocks", "label": "Content"},
+                     {"name": "Guardrail/PIIBlocks", "label": "PII"},
+                     {"name": "Guardrail/TopicBlocks", "label": "Topic"}], "period": 300},
+        {"title": "RAG Retrieval Quality (avg score)", "type": "line",   # NEW
+         "metric": "RAG/AvgRelevanceScore", "period": 300, "stat": "Average"},
+        {"title": "Kill Switch Status", "type": "number",   # NEW
+         "metric": "Governance/KillSwitchTriggered", "period": 60, "stat": "Maximum"},
+    ],
+    "alarms": [
+        {"name": "HighErrorRate", "metric": "AgentCore/Errors", "threshold": 0.02,
+         "period": 300, "action": "SNS → kill-switch-topic → Lambda disables runtime"},
+        {"name": "HighLatencyP99", "metric": "AgentCore/Latency", "stat": "p99",
+         "threshold": 8.0, "period": 300, "action": "SNS → ops-team-pager"},
+        {"name": "GuardrailViolationSpike", "metric": "Guardrail/TotalBlocks",
+         "threshold": 50, "period": 300,   # 50 blocks / 5 min → possible attack
+         "action": "SNS → security-team + compliance"},
+    ],
+    "xray_tracing": {
+        "enabled": True,
+        "sampling_rate": 0.10,   # 10% — higher for financial audit trail
+        "annotations": ["query_type", "agent_name", "model_id", "client_tier", "compliance_flag"],
+    },
 }
 
 
@@ -117,25 +205,25 @@ def estimate_monthly_costs(agents: list, days: int = 30) -> dict:
     # Add each as costs["name"] = {"monthly_cost": estimated_cost}
     infrastructure_costs = {
         "dynamodb": {
-            "table_state": 0.0,  # TODO 6a: State table (transactions, reads/writes)
-            "table_audit": 0.0,  # TODO 6b: Audit log table (compliance requirement)
+            "table_state": 25.0,   # on-demand, ~10K reads/writes per day
+            "table_audit": 15.0,   # compliance: write-heavy, 7-day+ retention
         },
         "knowledge_bases": {
-            "market_data_kb": 0.0,  # TODO 6c: Market data retrieval KB
-            "compliance_kb": 0.0,   # TODO 6d: Compliance & regulatory KB
-            "risk_assessment_kb": 0.0,  # TODO 6e: Risk assessment KB
+            "market_data_kb": 30.0,     # S3 Vectors storage + embeddings + queries
+            "compliance_kb": 30.0,
+            "risk_assessment_kb": 30.0,
         },
         "cloudwatch": {
-            "logs": 0.0,  # TODO 6f: CloudWatch Logs ingestion/storage
-            "metrics": 0.0,  # TODO 6g: Custom metrics
-            "dashboard": 0.0,  # TODO 6h: Dashboard
+            "logs": 20.0,       # ingestion + storage at INFO level, prod volume
+            "metrics": 10.0,    # custom metrics (per-agent latency, guardrail counts)
+            "dashboard": 3.0,   # $3/dashboard/month
         },
         "xray": {
-            "sampling_and_analysis": 0.0,  # TODO 6i: 10% sampling rate
+            "sampling_and_analysis": 15.0,  # 10% sampling (higher than demo's 5%)
         },
         "vpc": {
-            "nat_gateway": 0.0,  # TODO 6j: VPC NAT gateway (outbound traffic)
-            "vpc_endpoints": 0.0,  # TODO 6k: VPC endpoints for Bedrock, S3
+            "nat_gateway": 32.0,    # ~$0.045/hr + data processing
+            "vpc_endpoints": 22.0,  # interface endpoints for Bedrock + S3
         },
     }
 
@@ -149,6 +237,13 @@ def estimate_monthly_costs(agents: list, days: int = 30) -> dict:
         for cost in category.values()
     )
     total += infra_total
+
+    # TODO 6l: per-category display rows (already counted in infra_total above — display only)
+    costs["DynamoDB"] = {"monthly_cost": round(sum(infrastructure_costs["dynamodb"].values()), 2)}
+    costs["Knowledge Bases"] = {"monthly_cost": round(sum(infrastructure_costs["knowledge_bases"].values()), 2)}
+    costs["CloudWatch"] = {"monthly_cost": round(sum(infrastructure_costs["cloudwatch"].values()), 2)}
+    costs["X-Ray"] = {"monthly_cost": round(sum(infrastructure_costs["xray"].values()), 2)}
+    costs["VPC"] = {"monthly_cost": round(sum(infrastructure_costs["vpc"].values()), 2)}
 
     costs["TOTAL"] = {"monthly_cost": round(total, 2)}
     return costs
@@ -168,23 +263,23 @@ OPERATIONAL_RUNBOOK = {
     "deploy": {
         "name": "Production Deployment",
         "steps": [
-            # TODO 7a: Add step 1 (run test suite)
-            # TODO 7b: Add step 2 (validate guardrail configuration)
-            # TODO 7c: Add step 3 (deploy new runtime version)
-            # TODO 7d: Add step 4 (run smoke tests on 10 test transactions)
-            # TODO 7e: Add step 5 (monitor error rate and latency for 5 minutes)
+            "1. Run the full agent test suite — all task2-task6 tests must pass",
+            "2. Validate the guardrail config and confirm a non-DRAFT version is promoted",
+            "3. Deploy the new AgentCore Runtime version (create/update agent runtime)",
+            "4. Run smoke tests on 10 representative transactions against the new version",
+            "5. Monitor error rate and P99 latency for 5 minutes before shifting full traffic",
         ],
-        "rollback_trigger": "",  # TODO 7f: Under what condition do we rollback? (e.g., "Error rate > 2%")
+        "rollback_trigger": "Error rate > 2% OR P99 latency > 8s during the 5-minute watch",
         "estimated_duration_minutes": 15,  # Estimate time to complete
     },
 
     "rollback": {
         "name": "Emergency Rollback",
         "steps": [
-            # TODO 7g: Add step 1 (identify previous stable runtime version)
-            # TODO 7h: Add step 2 (revert runtime to previous version)
-            # TODO 7i: Add step 3 (verify agents are responding to transactions)
-            # TODO 7j: Add step 4 (post-incident review - what went wrong?)
+            "1. Identify the previous stable runtime version from the deploy history",
+            "2. Revert the runtime to that previous version (update agent runtime)",
+            "3. Verify agents respond correctly on the 10 smoke-test transactions",
+            "4. Hold a post-incident review — root-cause what the new version broke",
         ],
         "estimated_duration_minutes": 10,
     },
@@ -192,13 +287,13 @@ OPERATIONAL_RUNBOOK = {
     "kill_switch": {
         "name": "Kill Switch Activation",
         "steps": [
-            # TODO 7k: Add step 1 (acknowledge alert in PagerDuty)
-            # TODO 7l: Add step 2 (check AWS X-Ray for error patterns)
-            # TODO 7m: Add step 3 (check CloudWatch audit logs for anomalies)
-            # TODO 7n: Add step 4 (disable runtime if attack/fraud detected)
-            # TODO 7o: Add step 5 (notify compliance team)
+            "1. Acknowledge the alert in PagerDuty to stop escalation",
+            "2. Check the X-Ray service map for error/latency patterns across agents",
+            "3. Check CloudWatch audit logs for anomalies (spike source, repeated inputs)",
+            "4. Disable the runtime if an attack or fraud pattern is confirmed",
+            "5. Notify the compliance team (required for a financial-system shutdown)",
         ],
-        "threshold": "",  # TODO 7p: What metric threshold triggers this? (e.g., "Guardrail blocks > 50/5min")
+        "threshold": "Guardrail blocks > 50 in 5 minutes (GuardrailViolationSpike alarm)",
         "requires_approval": True,  # Financial system requires human approval
         "estimated_duration_minutes": 5,
     },
@@ -206,11 +301,11 @@ OPERATIONAL_RUNBOOK = {
     "latency_investigation": {
         "name": "High Latency Investigation",
         "steps": [
-            # TODO 7q: Add step 1 (pull X-Ray service map to identify slow service)
-            # TODO 7r: Add step 2 (check per-agent latency in CloudWatch)
-            # TODO 7s: Add step 3 (identify bottleneck - agent, KB, or knowledge base retrieval?)
-            # TODO 7t: Add step 4 (check DynamoDB throttling or KB latency)
-            # TODO 7u: Add step 5 (scale the bottleneck component - more provisioned capacity?)
+            "1. Pull the X-Ray service map to find which node is slow",
+            "2. Check per-agent latency in CloudWatch to isolate the agent",
+            "3. Identify the bottleneck — orchestrator, a worker agent, or KB retrieval",
+            "4. Check for DynamoDB throttling or elevated KB retrieval latency",
+            "5. Scale the bottleneck (provisioned capacity / parallelism) and re-measure",
         ],
         "trigger_threshold": "P99 latency > 8 seconds",
         "estimated_duration_minutes": 20,
@@ -233,10 +328,41 @@ def main():
     print("  1. AgentCore Runtime Configuration")
     print(f"{'━' * 70}")
 
-    # TODO 8: Print the runtime config, agent definitions, monitoring strategy,
-    #         cost estimates, and operational runbook
-    # Hint: Follow the demo's main() output format
-    print("  [Complete TODOs 1-7 to populate this output]")
+    # TODO 8: Print runtime config, agents, monitoring strategy, and runbook
+    rc = VECTRABANK_RUNTIME_CONFIG
+    print(f"  Runtime:  {rc['agentRuntimeName']}")
+    print(f"  Network:  {rc['networkConfiguration']['networkMode']} (internal-only)")
+    print(f"  Guardrail: {rc['guardrailConfiguration']['guardrailIdentifier']} "
+          f"v{rc['guardrailConfiguration']['guardrailVersion']}")
+    print(f"  Env vars: {', '.join(rc['environmentVariables'].keys())}")
+
+    print(f"\n{'━' * 70}")
+    print("  2. Agent Definitions")
+    print(f"{'━' * 70}")
+    for a in VECTRABANK_AGENTS:
+        print(f"  {a['name']:<22s} {a['model']:<48s} temp={a['temperature']}")
+        print(f"    role: {a['role']}")
+
+    print(f"\n{'━' * 70}")
+    print("  3. Monitoring Strategy")
+    print(f"{'━' * 70}")
+    m = VECTRABANK_MONITORING
+    print(f"  Dashboard '{m['dashboard_name']}' — {len(m['widgets'])} widgets:")
+    for w in m["widgets"]:
+        print(f"    • {w['title']}")
+    print(f"  Alarms ({len(m['alarms'])}):")
+    for al in m["alarms"]:
+        print(f"    • {al['name']}: threshold={al['threshold']} → {al['action']}")
+    print(f"  X-Ray: {int(m['xray_tracing']['sampling_rate']*100)}% sampling, "
+          f"annotations={m['xray_tracing']['annotations']}")
+
+    print(f"\n{'━' * 70}")
+    print("  5. Operational Runbook")
+    print(f"{'━' * 70}")
+    for key, proc in OPERATIONAL_RUNBOOK.items():
+        print(f"\n  {proc['name']} (~{proc['estimated_duration_minutes']} min):")
+        for step in proc["steps"]:
+            print(f"    {step}")
 
     if VECTRABANK_AGENTS:
         # ── Cost Estimation ──
