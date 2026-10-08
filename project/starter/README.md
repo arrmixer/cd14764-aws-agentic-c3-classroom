@@ -63,15 +63,27 @@ Shared State: DynamoDB WorkflowStateTable (with optimistic locking)
 
 ## Prerequisites
 
-- Python 3.11+
+- Python 3.12 (matches the deployed runtime)
 - AWS account with Bedrock access enabled (`us-east-1` region)
-- IAM permissions for: Bedrock, Bedrock AgentCore, DynamoDB, S3, S3 Vectors, CloudFormation, CloudWatch, X-Ray
+- IAM permissions for: Bedrock, Bedrock AgentCore, DynamoDB, S3, S3 Vectors, CloudFormation, CloudWatch, X-Ray (the AgentCore CLI deploys through AWS CDK, so `cloudformation:*`, `iam:PassRole` and the CDK bootstrap roles are needed too)
 - Bedrock Knowledge Bases created manually in AWS Console (Task 5)
-- The AgentCore Runtime runs on arm64 and Python 3.12; the deploy command downloads matching wheels for you (needs `pip` and internet access)
+- **AgentCore CLI** (`agentcore`, npm package [`@aws/agentcore`](https://github.com/aws/agentcore-cli)) - the deploy command uses it to package and deploy the runtime (Task 3). It needs **Node.js 20+** and [**uv**](https://docs.astral.sh/uv/getting-started/installation/):
+
+  ```bash
+  npm install -g @aws/agentcore@0.30.0
+  agentcore --version
+  ```
+
+  > The CLI replaces the older Python `bedrock-agentcore-starter-toolkit`. Both install an `agentcore` command, so uninstall the old one if you have it: `pip uninstall bedrock-agentcore-starter-toolkit`.
+- The AgentCore Runtime runs on arm64 and Python 3.12; `agentcore deploy` downloads matching wheels for you with `uv` (needs internet access)
 
 ---
 
 ## Setup
+
+This is the unfinished student starter: complete the TODOs in `src/agent_orchestrator.py`. The CLI configuration and support modules are provided infrastructure, not exercise solutions. Runtime deployment and runtime configuration updates use AgentCore CLI; application service calls still use the AWS SDK.
+
+Use the tested CLI version **0.30.0** shown above. The supplied CDK compatibility fix keeps HTTP explicit in the deployed runtime metadata.
 
 ### 1. Install Dependencies
 
@@ -91,7 +103,14 @@ python config.py
 
 Expected output: Configuration table showing all resource names. Fields showing `(not yet created)` are expected - they are populated as each task is completed.
 
-### 3. Seed Initial Data
+### 3. Verify the AgentCore CLI
+
+```bash
+agentcore --version      # 0.30.0 or newer
+agentcore validate       # checks agentcore/agentcore.json (the runtime definition)
+```
+
+### 4. Seed Initial Data
 
 Run once after the CloudFormation stack reaches `CREATE_COMPLETE`:
 
@@ -115,12 +134,20 @@ starter/
 ├── .env.example                           # Environment variable template
 ├── README.md                              # This file
 │
+├── agentcore/                             # AgentCore CLI project (used by `agentcore deploy`)
+│   ├── agentcore.json                     # Runtime definition: entry point, network mode, protocol, env vars
+│   ├── aws-targets.json                   # Deployment target (filled in by the CLI on first deploy)
+│   └── cdk/                               # CDK app the CLI deploys with (managed by the CLI)
+│
 ├── src/                                   # Implementation files
 │   ├── agent_orchestrator.py             # Multi-agent orchestration (Tasks 2, 3, 4, 6) ⭐
 │   ├── agent_utils.py                    # Pre-written: terminal trace UI utilities
 │   ├── agent_observability.py            # Pre-written: X-Ray tracing + CloudWatch logging layer
+│   ├── agentcore_cli.py                  # Pre-written: AgentCore CLI wrapper (stage code, agentcore deploy)
 │   ├── bedrock_kb_retrieval.py           # Pre-written: KB retrieval helper
 │   └── demo.py                           # Pre-written: demo script
+│
+├── build/runtime/                         # Created by deploy: the code the CLI packages (gitignored)
 │
 ├── infrastructure/
 │   ├── starter_stack.yaml                 # CloudFormation: foundation infra (DynamoDB, S3, S3 Vectors, IAM, CloudWatch)
@@ -137,6 +164,8 @@ starter/
 - `infrastructure/` - Pre-deployed resources
 - `src/agent_utils.py` - Terminal trace UI utilities
 - `src/agent_observability.py` - X-Ray tracing and CloudWatch logging
+- `src/agentcore_cli.py` - AgentCore CLI wrapper
+- `agentcore/` - AgentCore CLI project (the deploy command writes the runtime settings into `agentcore.json` for you)
 - `src/bedrock_kb_retrieval.py` - KB retrieval helper
 - `src/demo.py` - Demo script
 
@@ -192,7 +221,7 @@ The orchestrator system prompt must enforce these routing rules exactly:
 | 2 | Order status / return / refund requests | Call `route_to_inventory_agent` → then `route_to_refund_agent` |
 | 3 | Policy meaning questions (windows, rates, terms) | Call `route_to_policy_agent` |
 | 4 | Account questions ("what is my tier?", "am I premium?") | Call `route_to_inventory_agent` - **never** `route_to_policy_agent` (it only knows policy text, not customer data) |
-| 5 | Math / calculation questions | Answer directly - no routing needed |
+| 5 | Math / calculation questions | Calculate without Inventory, Policy or Refund; call CommunicationAgent last |
 | 6 | Every request, always (last step) | Call `route_to_communication_agent` to compose the final reply |
 
 > **CRITICAL:** The Orchestrator is **never** permitted to write the final customer-facing response itself. It must always delegate to `route_to_communication_agent` as its very last action - no exceptions, even when it believes it already has a complete answer.
@@ -211,20 +240,29 @@ python tests/test_agent.py task2
   - Content filtering: SEXUAL, VIOLENCE, HATE (HIGH strength) + INSULTS, MISCONDUCT (MEDIUM strength)
   - PII redaction (emails, phones anonymized; credit cards and SSNs blocked)
   - Topic blocking (competitor products, pricing negotiations, legal threats)
+  - Use `topicPolicyConfig.tierConfig = {"tierName": "STANDARD"}` and top-level `crossRegionConfig = {"guardrailProfileIdentifier": "us.guardrail.v1:0"}`. Define pricing negotiations narrowly as haggling or changing an advertised price; permit arithmetic with an already-specified price and discount. Classic-tier definitions tested in this project blocked the required math scenario. Validate arithmetic inputs/outputs and blocked negotiation, competitor and legal-threat examples. See [AWS safeguard tiers](https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-tiers.html).
   - Profanity filtering
   - Then `create_guardrail_version()` so the returned version is a number, not `DRAFT`
 
-- **`deploy_to_agentcore_runtime()`** - Deploy the system to AgentCore Runtime with the guardrail attached
-  - The pre-written part zips your `agent_orchestrator.py` (which doubles as the HTTP entry point - `serve` mode) with its helper modules and arm64 dependencies, and uploads it to S3 (*direct code deployment*)
-  - Your part: `create_agent_runtime()` with `codeConfiguration` pointing at that zip, `networkMode: PUBLIC`, `serverProtocol: HTTP`, and environment variables (region, project name, KB IDs, log group, `GUARDRAIL_ID`, `GUARDRAIL_VERSION`)
-  - **How the guardrail is attached:** `create_agent_runtime()` has no guardrail parameter. Guardrails are enforced per model call, so the pre-written `_apply_guardrail()` sets `guardrail_id` / `guardrail_version` on every agent's `BedrockModel` whenever `GUARDRAIL_ID` and `GUARDRAIL_VERSION` are known - from `.env` locally, from the runtime environment variables you pass when deployed
+- **`deploy_to_agentcore_runtime()`** - Deploy the system to AgentCore Runtime with the guardrail attached, using the **AgentCore CLI** (`agentcore`, wrapped by the pre-written `src/agentcore_cli.py`)
+  - The pre-written part stages your `agent_orchestrator.py` (which doubles as the HTTP entry point - `serve` mode) with its helper modules and `config.py` in `build/runtime/` - the directory `agentcore/agentcore.json` points at (`codeLocation`)
+  - Your part:
+    1. build the runtime environment variables dict (region, project name, KB IDs, log group, `GUARDRAIL_ID`, `GUARDRAIL_VERSION`)
+    2. `agentcore_cli.configure_runtime(env_vars=..., network_mode='PUBLIC', protocol='HTTP', execution_role_arn=config.AGENTCORE_ROLE_ARN)` - writes those settings into `agentcore/agentcore.json`
+    3. `agentcore_cli.deploy()` - runs `agentcore deploy -y`: the CLI packages `build/runtime/` with arm64 dependencies (*direct code deployment*, `build: CodeZip`) and creates or updates the runtime through a CDK stack (`AgentCore-udacity-default`)
+    4. `agentcore_cli.deployed_runtime_arn()` - the ARN the CLI recorded in `agentcore/.cli/deployed-state.json`
+  - **How the guardrail is attached:** the runtime has no guardrail parameter. Guardrails are enforced per model call, so the pre-written `_apply_guardrail()` sets `guardrail_id` / `guardrail_version` on every agent's `BedrockModel` whenever `GUARDRAIL_ID` and `GUARDRAIL_VERSION` are known - from `.env` locally, from the runtime environment variables you declare when deployed
 
-**Deploy & Test:**
+**Deployment order:** Implement Tasks 2–6 and create/sync the three S3 Vectors Knowledge Bases in Task 5 before running the full deployment. Set all three KB IDs in `.env`. The command below also calls the Task 4 Memory and Task 6 Observability functions, so those implementations must be ready. Task 3's runtime check requires the KB IDs even though Task 5 appears later in this guide.
+
+**Deploy & Test (after those prerequisites):**
 ```bash
 python src/agent_orchestrator.py deploy
 ```
 
-The deploy command prints the Runtime ARN and Guardrail ID/Version on completion. Copy those values into your `.env` file:
+The first deployment also bootstraps AWS CDK in your account (a `CDKToolkit` stack) and installs the CDK app's npm packages - allow 5-10 minutes. Re-running the command is safe: an unchanged runtime is left alone, a changed one is updated in place.
+
+The deploy command prints the Runtime ARN and Guardrail ID/Version on completion (`agentcore status` shows the same runtime). Copy those values into your `.env` file:
 
 ```
 AGENTCORE_RUNTIME_ARN=<printed arn>
@@ -268,7 +306,7 @@ Create 3 Knowledge Bases in the AWS Console. The S3 data bucket and the S3 Vecto
 | Vector bucket | *Vector Bucket* from `python config.py` | same | same |
 | Vector index | `returns-policy-index` | `shipping-policy-index` | `warranty-policy-index` |
 
-The vector bucket and the three indexes are created by the CloudFormation stack (dimension 1024, cosine, `AMAZON_BEDROCK_TEXT` non-filterable), so pick them in the wizard - do **not** use *Quick create a new vector store*. After creating each KB, click **Sync** on its data source.
+Choose a self-managed Knowledge Base with the existing S3 Vectors store, not a Managed Knowledge Base. The vector bucket and the three indexes are created by the CloudFormation stack (dimension 1024, cosine, `AMAZON_BEDROCK_TEXT` non-filterable), so pick them in the wizard - do **not** use *Quick create a new vector store*. After creating each KB, click **Sync** on its data source.
 
 After creating all three KBs, add their IDs to `.env`:
 ```
@@ -276,6 +314,8 @@ RETURNS_KB_ID=
 SHIPPING_KB_ID=
 WARRANTY_KB_ID=
 ```
+
+Complete Task 6 before the first full deployment. If you deployed earlier, run `python src/agent_orchestrator.py deploy` again after setting these IDs; editing local `.env` alone does not update the deployed runtime. Then rerun `python tests/test_agent.py task3` and the Task 5 test below.
 
 **Test:**
 ```bash
@@ -315,12 +355,12 @@ When you run `python src/agent_orchestrator.py deploy`, it executes a 6-step pip
 |------|-------------|
 | 1/6 | Build the 5-agent graph locally |
 | 2/6 | Create the Bedrock Guardrail |
-| 3/6 | Package the code (arm64 zip) and deploy to AgentCore Runtime |
+| 3/6 | Stage the code in `build/runtime/`, write the runtime settings to `agentcore/agentcore.json` and deploy with `agentcore deploy -y` (AgentCore CLI) |
 | 4/6 | Create AgentCore Memory |
-| 5/6 | Configure Observability (CloudWatch + X-Ray Transaction Search) |
+| 5/6 | Configure Observability (CloudWatch + X-Ray Transaction Search) - the runtime environment variables are applied with a second `agentcore deploy -y` |
 | 6/6 | Deploy AgentCore Gateway *(skipped if Lambda tool functions not deployed)* |
 
-Step 6 is pre-written scaffolding — it registers your Lambda-backed tool APIs on a managed MCP endpoint so agents can discover and invoke them at runtime. It requires Lambda functions to be deployed separately and their names set as `ORDERS_FUNCTION`, `POLICY_FUNCTION`, `CUSTOMERS_FUNCTION` in your `.env`. If those aren't set, Step 6 prints a note and the rest of the deployment completes normally.
+Step 6 is an optional extension, not required for the project or its 120-point grading suite. To opt in, deploy Lambda tool functions separately and set their names in `ORDERS_FUNCTION`, `POLICY_FUNCTION`, and/or `CUSTOMERS_FUNCTION` in `.env`. The scaffolding checks configured functions before creating a gateway. If none are available, it prints a skip message and creates no gateway. Missing functions are reported; other AWS errors are reported as failures of the optional step. Agents continue to use their in-process tools; using the gateway requires a separate MCP client integration.
 
 ---
 
@@ -332,7 +372,7 @@ After completing all tasks, run the full deployment and verify these three scena
 |----------|-----------------|
 | `"I want to return my order ORD-27176"` (CUST-001) | Orchestrator → Inventory → Refund → Communication |
 | `"What is the return policy for premium customers?"` | Orchestrator → Policy (3 parallel KB retrievers) → Communication |
-| `"How much are 5 items at $29.99 with 10% off?"` | Orchestrator answers directly (no sub-agent routing needed) |
+| `"How much are 5 items at $29.99 with 10% off?"` | Orchestrator → Communication (no Inventory, Policy or Refund) |
 
 **Required deliverable:** 
 - Take a screenshot that shows that all test passed, and shows that you have 120 scores (`python tests/test_agent.py all`).
@@ -349,7 +389,7 @@ python infrastructure/cleanup.py          # dry run - lists what would be delete
 python infrastructure/cleanup.py --yes    # deletes it
 ```
 
-The script deletes, in dependency order: the three Knowledge Bases (with their data sources and the service roles the console created for them), the AgentCore Runtime and Memory, the Guardrail, the contents of the policy bucket, the CloudFormation stack (DynamoDB tables, buckets, S3 Vectors bucket and indexes, execution role, log group) and the runtime log groups. Deletions of Knowledge Bases and AgentCore resources are asynchronous - run it a second time to confirm nothing is left. Add `--disable-transaction-search` if you also want to switch CloudWatch Transaction Search back off.
+The script deletes, in dependency order: the three Knowledge Bases (with their data sources and the service roles the console created for them), the AgentCore CLI stack that holds the AgentCore Runtime (`AgentCore-udacity-default`) and the Memory, the Guardrail, the contents of the policy bucket, the CloudFormation stack (DynamoDB tables, buckets, S3 Vectors bucket and indexes, execution role, log group) and the runtime log groups. Deletions of Knowledge Bases and AgentCore resources are asynchronous - run it a second time to confirm nothing is left. Add `--disable-transaction-search` if you also want to switch CloudWatch Transaction Search back off.
 
 > Do this **after** submitting: the reviewer needs your screenshots, but nothing in the reviewed submission depends on the resources still existing.
 
@@ -392,6 +432,12 @@ python src/agent_orchestrator.py chat
 Send one message to the **deployed** AgentCore Runtime (after Task 3):
 ```bash
 python src/agent_orchestrator.py invoke "What is the return policy for premium customers?" CUST-002
+
+# or with the AgentCore CLI (customer defaults to CUST-001; pass JSON to choose one)
+agentcore invoke "What is the return policy for premium customers?"
+agentcore invoke '{"prompt": "I want to return my order ORD-27176", "customer_id": "CUST-001"}'
+agentcore status        # deployed runtime details
+agentcore logs          # runtime logs
 ```
 
 The `chat` command opens a conversation loop where you type queries and watch the orchestrator route them in real time - colour-coded by agent (Inventory, Policy, Refund, Communication). It uses a pre-written terminal UI (`AgentTrace` / `_TraceWriter`) built into `agent_orchestrator.py`. **This scaffolding is pre-implemented and requires no modification.**
@@ -416,7 +462,7 @@ python src/agent_orchestrator.py deploy
 This:
 1. Builds all 5 agents
 2. Creates guardrail
-3. Deploys to AgentCore Runtime
+3. Deploys to AgentCore Runtime with the AgentCore CLI (`agentcore deploy -y`, definition in `agentcore/agentcore.json`)
 4. Configures memory
 5. Enables observability
 
@@ -476,6 +522,7 @@ with ThreadPoolExecutor(max_workers=3) as executor:
 
 - [Strands Agents SDK](https://github.com/strands-agents/sdk-python)
 - [Amazon Bedrock AgentCore](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/)
+- [AgentCore CLI](https://github.com/aws/agentcore-cli) (`@aws/agentcore`) - [command reference](https://github.com/aws/agentcore-cli/blob/main/docs/commands.md), [configuration reference](https://github.com/aws/agentcore-cli/blob/main/docs/configuration.md)
 - [Bedrock Knowledge Bases](https://docs.aws.amazon.com/bedrock/latest/userguide/knowledge-base.html)
 - [Bedrock Guardrails](https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails-create.html)
 - [DynamoDB Optimistic Locking](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis.html)
@@ -499,7 +546,8 @@ RETURNS_KB_ID=
 SHIPPING_KB_ID=
 WARRANTY_KB_ID=
 
-# AgentCore Runtime (Task 3) - populated by: python src/agent_orchestrator.py deploy
+# AgentCore Runtime (Task 3) - printed by: python src/agent_orchestrator.py deploy
+# (created with the AgentCore CLI from agentcore/agentcore.json; `agentcore status` shows it too)
 AGENTCORE_RUNTIME_ARN=
 
 # Guardrail (Task 3) - populated by the deploy command above (a numbered version, not DRAFT)
@@ -538,8 +586,14 @@ Each `test`/`chat`/`demo` run prints `X-Ray trace <id> published`. If it says *n
 **`check_order_status` fails with "The provided key element does not match the schema"?**
 The Orders table key is `customer_id` + `order_id` - pass both to `get_item`.
 
-**Deploy fails while downloading arm64 dependencies?**
-`build_deployment_package()` (pre-written, in `agent_orchestrator.py`) runs `pip install --platform manylinux2014_aarch64 --python-version 3.12 --only-binary=:all:`. It needs internet access and a recent `pip` (`python -m pip install --upgrade pip`).
+**`agentcore: command not found` / "The AgentCore CLI is not installed"?**
+Install Node.js 20+ and run `npm install -g @aws/agentcore@0.30.0` (see Prerequisites). If `agentcore` exists but prints toolkit-style help (`agentcore configure`, `agentcore launch`), that is the old Python starter toolkit - remove it with `pip uninstall bedrock-agentcore-starter-toolkit` so the npm CLI is the one on your PATH.
+
+**`agentcore deploy` fails while packaging (uv / wheels)?**
+The CLI runs `uv pip install --python-version 3.12 --python-platform aarch64-manylinux2014 --only-binary :all:` against `build/runtime/pyproject.toml`. It needs [`uv`](https://docs.astral.sh/uv/getting-started/installation/) on your PATH and internet access. Run `python src/agentcore_cli.py` to check what the wrapper sees, and read `agentcore/.cli/logs/` for the CLI's own log.
+
+**`agentcore deploy` fails with a CDK / CloudFormation error?**
+The first deploy bootstraps CDK (`CDKToolkit` stack) - make sure your credentials may create CloudFormation stacks and IAM roles. Check the stack `AgentCore-udacity-default` in **AWS Console → CloudFormation** for the failing resource, fix the cause and re-run `python src/agent_orchestrator.py deploy` (or `agentcore deploy -y`). `agentcore status` shows what is deployed.
 
 ---
 

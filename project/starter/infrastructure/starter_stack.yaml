@@ -245,8 +245,9 @@ Resources:
                   - !GetAtt WorkflowStateTable.Arn
 
               # S3 - policy documents bucket
-              # Used by seed_data.py to upload docs, by Bedrock KB sync, and
-              # by the AgentCore Runtime to download the deployment package.
+              # Used by seed_data.py to upload docs and by Bedrock KB sync.
+              # (The AgentCore CLI stores the runtime code package in the CDK
+              # assets bucket, not here.)
               - Effect: Allow
                 Action:
                   - s3:GetObject

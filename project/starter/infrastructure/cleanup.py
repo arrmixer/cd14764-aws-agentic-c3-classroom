@@ -6,7 +6,10 @@ dependency order, so the account is back to its pre-project state:
 
   1. Bedrock Knowledge Bases (+ data sources) and the service roles/policies the
      console wizard created for them  (AmazonBedrockExecutionRoleForKnowledgeBase_*)
-  2. AgentCore Runtime, Memory, workload identity (and the optional Gateway)
+  2. The AgentCore CLI stack that holds the AgentCore Runtime
+     (AgentCore-udacity-default, created by `agentcore deploy`), Memory,
+     workload identity (and the optional Gateway). The shared CDK bootstrap
+     stack (CDKToolkit) is left in place.
   3. Bedrock Guardrail (all versions)
   4. S3 policy bucket contents (all object versions + delete markers)
   5. The CloudFormation stack (DynamoDB tables, S3 bucket, S3 Vectors bucket +
@@ -143,14 +146,56 @@ def _delete_policy(iam, arn):
 
 # ─────────────────────────── 2. AgentCore ───────────────────────────
 
+def wait_for_stack_gone(cf, name, timeout=900):
+    print("  waiting for DELETE_COMPLETE", end='', flush=True)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            st = cf.describe_stacks(StackName=name)['Stacks'][0]['StackStatus']
+        except ClientError:
+            print(' done.')
+            return
+        if st == 'DELETE_FAILED':
+            print(' DELETE_FAILED')
+            for ev in cf.describe_stack_events(StackName=name)['StackEvents'][:20]:
+                if ev.get('ResourceStatus') == 'DELETE_FAILED':
+                    say(f"    {ev['LogicalResourceId']}: {ev.get('ResourceStatusReason', '')}")
+            raise RuntimeError("stack deletion failed - see reasons above; fix and re-run")
+        print('.', end='', flush=True)
+        time.sleep(10)
+    raise TimeoutError("stack still deleting after 15 min")
+
+
 def cleanup_agentcore():
-    print("\n2. AgentCore runtime, memory, workload identity, gateway")
+    print("\n2. AgentCore runtime (AgentCore CLI stack), memory, workload identity, gateway")
     ctl = boto3.client('bedrock-agentcore-control', region_name=REGION)
-    runtime_ids = []
+    cf  = boto3.client('cloudformation', region_name=REGION)
+    runtime_ids = [rt['agentRuntimeId']
+                   for rt in safe(lambda: ctl.list_agent_runtimes().get('agentRuntimes', []), [])
+                   if rt['agentRuntimeName'] == config.AGENTCORE_RUNTIME_NAME]
+
+    # The runtime was created by `agentcore deploy` (AgentCore CLI) as a CDK /
+    # CloudFormation stack - delete the stack so CloudFormation removes the
+    # runtime cleanly, then remove anything with the runtime name left behind.
+    cli_stack = config.AGENTCORE_STACK_NAME
+    try:
+        status = cf.describe_stacks(StackName=cli_stack)['Stacks'][0]['StackStatus']
+        say(f"stack {cli_stack} is {status}")
+
+        def _delete_cli_stack():
+            cf.delete_stack(StackName=cli_stack)
+            wait_for_stack_gone(cf, cli_stack)
+            # forget the deployment locally so a later `agentcore deploy` starts clean
+            sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'src'))
+            import agentcore_cli
+            agentcore_cli.reset_deployed_state()
+        act(f"AgentCore CLI stack {cli_stack} (runtime {config.AGENTCORE_RUNTIME_NAME})", _delete_cli_stack)
+    except ClientError:
+        say(f"stack {cli_stack} does not exist (nothing deployed with the AgentCore CLI)")
+
     for rt in safe(lambda: ctl.list_agent_runtimes().get('agentRuntimes', []), []):
         if rt['agentRuntimeName'] == config.AGENTCORE_RUNTIME_NAME:
-            runtime_ids.append(rt['agentRuntimeId'])
-            act(f"agent runtime {rt['agentRuntimeName']} ({rt['agentRuntimeId']})",
+            act(f"agent runtime {rt['agentRuntimeName']} ({rt['agentRuntimeId']}) left outside the stack",
                 lambda rid=rt['agentRuntimeId']: ctl.delete_agent_runtime(agentRuntimeId=rid))
     for m in safe(lambda: ctl.list_memories().get('memories', []), []):
         if m['id'].startswith(config.MEMORY_NAME):
@@ -239,23 +284,7 @@ def cleanup_stack():
 
     def _delete():
         cf.delete_stack(StackName=PREFIX)
-        print("  waiting for DELETE_COMPLETE", end='', flush=True)
-        deadline = time.time() + 900
-        while time.time() < deadline:
-            try:
-                st = cf.describe_stacks(StackName=PREFIX)['Stacks'][0]['StackStatus']
-            except ClientError:
-                print(' done.')
-                return
-            if st == 'DELETE_FAILED':
-                print(' DELETE_FAILED')
-                for ev in cf.describe_stack_events(StackName=PREFIX)['StackEvents'][:20]:
-                    if ev.get('ResourceStatus') == 'DELETE_FAILED':
-                        say(f"    {ev['LogicalResourceId']}: {ev.get('ResourceStatusReason', '')}")
-                raise RuntimeError("stack deletion failed - see reasons above; fix and re-run")
-            print('.', end='', flush=True)
-            time.sleep(10)
-        raise TimeoutError("stack still deleting after 15 min")
+        wait_for_stack_gone(cf, PREFIX)
     act(f"stack {PREFIX} (tables, buckets, vector bucket + indexes, role, log group)", _delete)
 
 

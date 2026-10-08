@@ -189,8 +189,18 @@ def __getattr__(name: str):
 # Task 3: Filled in after deploying AgentCore Runtime
 AGENTCORE_RUNTIME_ARN = os.environ.get('AGENTCORE_RUNTIME_ARN', '')
 
-# Task 3: AgentCore Runtime name (underscores - AgentCore does not allow hyphens)
-AGENTCORE_RUNTIME_NAME = f"{PROJECT_NAME}-runtime".replace('-', '_')
+# Task 3: AgentCore CLI project (agentcore/agentcore.json) - the CLI names the
+# deployed runtime "<project name>_<agent name>". Keep these in sync with the
+# "name" fields in agentcore/agentcore.json.
+AGENTCORE_PROJECT_NAME = 'udacity'             # agentcore.json  -> "name"
+AGENTCORE_AGENT_NAME   = 'agentcore_runtime'   # agentcore.json  -> runtimes[0].name
+
+# Task 3: AgentCore Runtime name as created by the CLI (underscores - AgentCore
+# does not allow hyphens) -> udacity_agentcore_runtime
+AGENTCORE_RUNTIME_NAME = f"{AGENTCORE_PROJECT_NAME}_{AGENTCORE_AGENT_NAME}"
+
+# CloudFormation stack the CLI deploys the runtime with (AgentCore-<project>-<target>)
+AGENTCORE_STACK_NAME = f"AgentCore-{AGENTCORE_PROJECT_NAME}-default"
 
 # Task 4: AgentCore Memory name (underscores - AgentCore does not allow hyphens)
 MEMORY_NAMESPACE = f"{PROJECT_NAME}-memory"
@@ -242,6 +252,7 @@ def print_config():
     _display("Shipping KB ID:",      _resolve('SHIPPING_KB_ID'), "(not yet created)")
     _display("Warranty KB ID:",      _resolve('WARRANTY_KB_ID'), "(not yet created)")
     print("  " + "-"*56)
+    _display("Runtime Name:",        AGENTCORE_RUNTIME_NAME)
     _display("Runtime ARN:",         AGENTCORE_RUNTIME_ARN, "(not yet deployed)")
     _display("Guardrail ID:",        _resolve('GUARDRAIL_ID'),      "(not yet created)")
     _display("Guardrail Version:",   _resolve('GUARDRAIL_VERSION'), "(not yet created)")

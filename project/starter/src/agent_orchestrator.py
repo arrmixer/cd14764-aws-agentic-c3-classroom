@@ -27,9 +27,13 @@ updates it after the worker responds.
 Commands:
   python src/agent_orchestrator.py test            # 3 scenarios, local run, traced to X-Ray
   python src/agent_orchestrator.py chat            # interactive terminal chat
-  python src/agent_orchestrator.py deploy          # Tasks 3-6 deployment pipeline
+  python src/agent_orchestrator.py deploy          # Tasks 3-6 deployment pipeline (uses the AgentCore CLI)
   python src/agent_orchestrator.py invoke "<msg>"  # call the deployed AgentCore Runtime
   python src/agent_orchestrator.py serve           # HTTP server (what AgentCore Runtime runs)
+
+Deployment uses the AgentCore CLI (`agentcore`, npm package @aws/agentcore,
+https://github.com/aws/agentcore-cli) through the pre-written helper
+src/agentcore_cli.py - see the README for the prerequisites (Node.js 20+, uv).
 """
 
 import boto3
@@ -53,6 +57,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from strands import Agent
 from strands.models import BedrockModel
 from boto3.dynamodb.conditions import Key
+from botocore.exceptions import ClientError
 
 import config
 from bedrock_kb_retrieval import retrieve_from_knowledge_base, format_kb_results
@@ -486,6 +491,8 @@ def build_orchestrator_agent(
     pass
 
     # TODO: System prompt for the Orchestrator
+    # For arithmetic, skip Inventory, Policy and Refund, but still call
+    # CommunicationAgent last. Round currency only after the full calculation.
     pass
 
     # Each routing tool follows the same pattern:
@@ -630,88 +637,32 @@ def build_agent_graph(verbose: bool = False) -> Agent:
 
 
 # ═══════════════════════════════════════════════════════
-#  DEPLOYMENT PACKAGING
+#  DEPLOYMENT TOOLING - AgentCore CLI
 #
-#  AgentCore Runtime "direct code deployment" runs a zip that contains the
-#  code AND every dependency, compiled for linux/arm64 and the Python version
-#  selected in codeConfiguration.runtime - the runtime installs nothing.
-#  build_deployment_package() downloads matching wheels with pip
-#  (--platform/--python-version/--only-binary) and zips them together with
-#  this file, config.py and the other src/ modules. Inside the runtime this
-#  same file is the entry point: with no command-line argument it starts the
-#  HTTP server (see run_serve) instead of printing usage.
+#  The runtime is deployed with the AgentCore CLI (`agentcore`, npm package
+#  @aws/agentcore - https://github.com/aws/agentcore-cli) through the
+#  pre-written helper src/agentcore_cli.py:
+#
+#    agentcore_cli.stage_runtime_code()   copies this file, its helper modules
+#                                         and config.py to build/runtime/ with a
+#                                         pyproject.toml of the runtime deps
+#    agentcore_cli.configure_runtime()    writes the runtime settings (network
+#                                         mode, protocol, execution role, env
+#                                         vars) to agentcore/agentcore.json
+#    agentcore_cli.deploy()               runs `agentcore deploy -y`: the CLI
+#                                         downloads arm64 / Python 3.12 wheels
+#                                         with uv, zips them with the code
+#                                         (direct code deployment) and creates
+#                                         or updates the runtime via CDK
+#    agentcore_cli.deployed_runtime_arn() reads the ARN the CLI recorded
+#
+#  Inside the runtime this same file is the entry point: it is started with
+#  no command-line argument and serves HTTP (see run_serve). The marker file
+#  written next to it by stage_runtime_code() tells __main__ to do so.
 # ═══════════════════════════════════════════════════════
 
-RUNTIME_ENTRYPOINT   = 'agent_orchestrator.py'      # codeConfiguration.entryPoint
-RUNTIME_PYTHON       = 'PYTHON_3_12'                # codeConfiguration.runtime
-_RUNTIME_PY_VERSION  = '3.12'                       # must match RUNTIME_PYTHON
-_RUNTIME_PLATFORM    = 'manylinux2014_aarch64'      # AgentCore runs on arm64
-_RUNTIME_MARKER      = '.agentcore-runtime'         # tells __main__ to serve
-_RUNTIME_REQUIREMENTS = ['strands-agents>=1.0', 'bedrock-agentcore>=0.1',
-                         'boto3>=1.42', 'python-dotenv>=1.0']
-
-_SRC_DIR  = os.path.dirname(os.path.abspath(__file__))
-_ROOT_DIR = os.path.dirname(_SRC_DIR)
-_RUNTIME_PROJECT_FILES = [
-    os.path.join(_SRC_DIR, 'agent_orchestrator.py'),
-    os.path.join(_SRC_DIR, 'agent_utils.py'),
-    os.path.join(_SRC_DIR, 'agent_observability.py'),
-    os.path.join(_SRC_DIR, 'bedrock_kb_retrieval.py'),
-    os.path.join(_ROOT_DIR, 'config.py'),
-]
-
-
-def _zip_write(zf, full: str, arcname: str, data: bytes = None) -> None:
-    """Add one file with the 644/755 permissions AgentCore requires."""
-    import zipfile
-    info = zipfile.ZipInfo.from_file(full, arcname) if data is None else zipfile.ZipInfo(arcname)
-    info.compress_type = zipfile.ZIP_DEFLATED
-    executable = data is None and os.access(full, os.X_OK) and not full.endswith('.py')
-    info.external_attr = ((0o755 if executable else 0o644) & 0xFFFF) << 16
-    if data is None:
-        with open(full, 'rb') as fh:
-            data = fh.read()
-    zf.writestr(info, data)
-
-
-def build_deployment_package(output_path: str) -> str:
-    """Build the AgentCore deployment zip at output_path and return the path."""
-    import shutil, subprocess, tempfile, zipfile
-
-    missing = [p for p in _RUNTIME_PROJECT_FILES if not os.path.exists(p)]
-    if missing:
-        raise FileNotFoundError(f"Cannot package runtime, missing: {missing}")
-
-    with tempfile.TemporaryDirectory(prefix='agentcore-pkg-') as tmp:
-        deps_dir = os.path.join(tmp, 'deps')
-        os.makedirs(deps_dir)
-        print(f"  Downloading arm64 dependencies (python {_RUNTIME_PY_VERSION}) ...", flush=True)
-        subprocess.run([
-            sys.executable, '-m', 'pip', 'install', '--quiet', '--disable-pip-version-check',
-            '--target', deps_dir, '--platform', _RUNTIME_PLATFORM,
-            '--python-version', _RUNTIME_PY_VERSION, '--implementation', 'cp',
-            '--only-binary=:all:', '--upgrade', *_RUNTIME_REQUIREMENTS,
-        ], check=True)
-        for junk in ('bin', 'tests'):
-            shutil.rmtree(os.path.join(deps_dir, junk), ignore_errors=True)
-
-        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-        with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for dirpath, dirnames, filenames in os.walk(deps_dir):
-                dirnames[:] = [d for d in dirnames if d != '__pycache__']
-                for name in filenames:
-                    if not name.endswith(('.pyc', '.pyo')):
-                        full = os.path.join(dirpath, name)
-                        _zip_write(zf, full, os.path.relpath(full, deps_dir))
-            for path in _RUNTIME_PROJECT_FILES:
-                _zip_write(zf, path, os.path.basename(path))
-            _zip_write(zf, '', _RUNTIME_MARKER, data=b'agentcore runtime package\n')
-
-    size_mb = os.path.getsize(output_path) / (1024 * 1024)
-    print(f"  Package built: {output_path} ({size_mb:.1f} MB, entry point {RUNTIME_ENTRYPOINT})")
-    if size_mb > 250:
-        raise RuntimeError("Deployment package exceeds the 250 MB AgentCore limit")
-    return output_path
+_RUNTIME_MARKER = '.agentcore-runtime'         # written by agentcore_cli.stage_runtime_code()
+_SRC_DIR        = os.path.dirname(os.path.abspath(__file__))
 
 
 # ═══════════════════════════════════════════════════════
@@ -750,6 +701,13 @@ def create_guardrail() -> tuple[str, str]:
     #       EMAIL and PHONE -> ANONYMIZE
     #   - topicPolicyConfig - one DENY topic per entry in config.GUARDRAIL_BLOCKED_TOPICS
     #     (competitor products, pricing negotiations, legal threats)
+    #     Use topicPolicyConfig.tierConfig = {'tierName': 'STANDARD'} and
+    #     top-level crossRegionConfig = {'guardrailProfileIdentifier': 'us.guardrail.v1:0'}.
+    #     Define pricing negotiations as haggling / changing an advertised price,
+    #     excluding arithmetic using an already-specified price and discount.
+    #     Classic-tier definitions tested in this project blocked the math scenario.
+    #     Validate allowed arithmetic (input and output) and blocked negotiation,
+    #     competitor and legal-threat requests. Keep all required safety policies.
     #   - wordPolicyConfig - managedWordListsConfig with type PROFANITY
     #   - blockedInputMessaging and blockedOutputsMessaging
     #
@@ -766,14 +724,16 @@ def deploy_to_agentcore_runtime(
     guardrail_version: str
 ) -> str:
     """
-    Deploy the multi-agent system to Amazon Bedrock AgentCore Runtime.
+    Deploy the multi-agent system to Amazon Bedrock AgentCore Runtime with
+    the AgentCore CLI (src/agentcore_cli.py wraps it).
 
     AgentCore does not serialize Python objects, so `orchestrator_agent` is
-    not uploaded directly. Instead the packaging step below zips this file,
-    which doubles as the HTTP entry point (see run_serve), together with its
-    helper modules and all dependencies
-    compiled for arm64. The runtime is then created from that zip ("direct
-    code deployment").
+    not uploaded directly. Instead the pre-written staging step copies this
+    file, which doubles as the HTTP entry point (see run_serve), together
+    with its helper modules and config.py to build/runtime/. `agentcore
+    deploy` then packages that directory with arm64 dependencies and creates
+    or updates the runtime ("direct code deployment"). Re-running is safe:
+    an unchanged runtime is left alone, a changed one is updated in place.
 
     The guardrail is attached by environment variables: inside the runtime
     build_agent_graph() reads GUARDRAIL_ID / GUARDRAIL_VERSION and applies
@@ -783,55 +743,42 @@ def deploy_to_agentcore_runtime(
     Returns:
         The AgentCore Runtime ARN
     """
+    import agentcore_cli
+
     runtime_name = config.AGENTCORE_RUNTIME_NAME
-    s3_client    = boto3.client('s3', region_name=config.AWS_REGION)
-
-    # Check if runtime already exists
-    try:
-        existing = agentcore_control.list_agent_runtimes()
-        for r in existing.get('agentRuntimes', []):
-            if r['agentRuntimeName'] == runtime_name:
-                runtime_arn = r['agentRuntimeArn']
-                print(f"AgentCore Runtime already exists: {runtime_arn}")
-                return runtime_arn
-    except Exception as e:
-        print(f"  [Note] Could not check existing runtimes: {e}")
-
     print(f"  AWS Account: {config.ACCOUNT_ID}  |  Region: {config.AWS_REGION}")
+    print(f"  Runtime: {runtime_name}  |  CLI project: agentcore/agentcore.json "
+          f"(stack {agentcore_cli.stack_name()})")
+    previous_arn = agentcore_cli.deployed_runtime_arn()
+    if previous_arn:
+        print(f"  Runtime already deployed - updating it: {previous_arn}")
 
-    # Build the deployment package and upload it to S3.
-    package_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                'build', 'deployment_package.zip')
-    build_deployment_package(package_path)
+    # Stage the code the CLI packages (src modules + config.py + pyproject.toml).
+    agentcore_cli.stage_runtime_code()
 
-    artifact_key = f"agentcore-artifacts/{runtime_name}/deployment_package.zip"
-    s3_client.upload_file(package_path, config.POLICY_BUCKET, artifact_key)
-    print(f"  Artifact uploaded: s3://{config.POLICY_BUCKET}/{artifact_key}")
+    # TODO: Configure and deploy the runtime with the AgentCore CLI
+    # 1. Build the runtime environment variables dict `runtime_env` with:
+    #      AWS_REGION, PROJECT_NAME (config.AWS_REGION / config.PROJECT_NAME),
+    #      RETURNS_KB_ID, SHIPPING_KB_ID, WARRANTY_KB_ID (from config),
+    #      AGENT_LOG_GROUP (config.AGENT_LOG_GROUP), and the guardrail
+    #      (GUARDRAIL_ID = guardrail_id, GUARDRAIL_VERSION = guardrail_version)
+    # 2. Write the runtime settings to agentcore/agentcore.json with
+    #      agentcore_cli.configure_runtime(env_vars=runtime_env,
+    #                                      network_mode='PUBLIC',
+    #                                      protocol='HTTP',
+    #                                      execution_role_arn=config.AGENTCORE_ROLE_ARN)
+    # 3. Deploy:  agentcore_cli.deploy()        (runs `agentcore deploy -y`)
+    # 4. Read the ARN the CLI recorded:
+    #      runtime_arn = agentcore_cli.deployed_runtime_arn()
+    runtime_arn = None
 
-    # TODO: Deploy to AgentCore Runtime
-    # Use agentcore_control.create_agent_runtime() with:
-    #   - agentRuntimeName (runtime_name), description
-    #   - roleArn (config.AGENTCORE_ROLE_ARN)
-    #   - agentRuntimeArtifact = {'codeConfiguration': {
-    #         'code': {'s3': {'bucket': config.POLICY_BUCKET, 'prefix': artifact_key}},
-    #         'runtime': RUNTIME_PYTHON,
-    #         'entryPoint': [RUNTIME_ENTRYPOINT]}}
-    #   - networkConfiguration  {'networkMode': 'PUBLIC'}
-    #   - protocolConfiguration {'serverProtocol': 'HTTP'}
-    #   - environmentVariables: AWS_REGION, PROJECT_NAME, RETURNS_KB_ID,
-    #     SHIPPING_KB_ID, WARRANTY_KB_ID, AGENT_LOG_GROUP, and the guardrail
-    #     (GUARDRAIL_ID = guardrail_id, GUARDRAIL_VERSION = guardrail_version)
-    # Store the API response in `response`.
-    response = None
-
-    if response is None:
-        raise NotImplementedError("deploy_to_agentcore_runtime: create_agent_runtime() not implemented")
+    if not runtime_arn:
+        raise NotImplementedError("deploy_to_agentcore_runtime: AgentCore CLI deployment not implemented")
 
     # Wait for the runtime to become READY and return its ARN.
-    runtime_arn = response['agentRuntimeArn']
-    print(f"  Runtime created: {runtime_arn}")
+    print(f"  Runtime deployed: {runtime_arn}")
     print("  Waiting for runtime status READY", end='', flush=True)
-    wait_for_runtime_ready(agentcore_control, response['agentRuntimeId'])
+    wait_for_runtime_ready(agentcore_control, runtime_arn.split('/')[-1])
     print(' ready.')
     return runtime_arn
 
@@ -935,9 +882,9 @@ def configure_observability(runtime_arn: str) -> None:
 # ═══════════════════════════════════════════════════════
 
 # Lambda function names for gateway tool backends (set in .env after deploying)
-_ORDERS_FUNCTION    = os.environ.get('ORDERS_FUNCTION',    f"{config.PROJECT_NAME}-orders-api")
-_POLICY_FUNCTION    = os.environ.get('POLICY_FUNCTION',    f"{config.PROJECT_NAME}-policy-api")
-_CUSTOMERS_FUNCTION = os.environ.get('CUSTOMERS_FUNCTION', f"{config.PROJECT_NAME}-customers-api")
+_ORDERS_FUNCTION = os.environ.get('ORDERS_FUNCTION', '')
+_POLICY_FUNCTION = os.environ.get('POLICY_FUNCTION', '')
+_CUSTOMERS_FUNCTION = os.environ.get('CUSTOMERS_FUNCTION', '')
 
 
 def _gw_get_function_arn(function_name: str) -> str:
@@ -1056,38 +1003,17 @@ def deploy_agentcore_gateway() -> dict:
     """
     Create an AgentCore Gateway and register the NovaMart tool Lambda targets.
 
-    Production equivalent of the in-process @tool functions defined inside
-    build_*_agent(). Each tool becomes a Lambda function registered as a
-    gateway target; agents discover tools at runtime via the MCP endpoint —
-    no code changes needed when adding or updating tools.
-
-    Uses a three-step deployment pattern:
-      1. create_gateway  (MCP protocol, SEMANTIC search)
-      2. create_gateway_target  (one per Lambda-backed tool)
-      3. Agents connect via the returned gateway_url
+    Optional extension to the in-process @tool functions. Resolve configured
+    Lambda functions first; if none exist, skip gateway creation. Otherwise
+    create/reuse the gateway and submit its targets. Connecting agents to this
+    MCP endpoint requires separate integration; this starter uses in-process tools.
 
     Requires Lambda tool functions to be deployed via a separate stack.
     Set ORDERS_FUNCTION, POLICY_FUNCTION, CUSTOMERS_FUNCTION in .env.
 
     Returns:
-        dict with gateway_id, gateway_url, and status.
+        A SKIPPED result with a reason, or gateway details and target count.
     """
-    agentcore_ctrl = boto3.client('bedrock-agentcore-control',
-                                   region_name=config.AWS_REGION)
-
-    try:
-        gw_uuid = _gw_stack_uuid()
-    except Exception:
-        gw_uuid = config.PROJECT_NAME
-
-    gw_name = f"novamart-support-{gw_uuid}"
-    print(f"  Calling create_gateway (name: {gw_name})...")
-    gateway_id, gateway_url = _gw_get_or_create(
-        agentcore_ctrl, gw_name, config.AGENTCORE_ROLE_ARN,
-        "NovaMart customer support gateway. Provides order lookup, "
-        "policy search, and customer tier tools.",
-    )
-
     targets = [
         {
             'name':             'orders-api',
@@ -1118,15 +1044,43 @@ def deploy_agentcore_gateway() -> dict:
         },
     ]
 
-    print(f"\n  Registering {len(targets)} Gateway targets...")
-    for t in targets:
+    # Resolve optional Lambda targets before creating any gateway resources.
+    available = []
+    for target in targets:
+        if not target['function']:
+            continue
         try:
-            lambda_arn = _gw_get_function_arn(t['function'])
-            _gw_create_target(agentcore_ctrl, gateway_id, t, lambda_arn)
-        except Exception as e:
-            print(f"    [Skipped] {t['name']}: {e}")
+            available.append((target, _gw_get_function_arn(target['function'])))
+        except ClientError as exc:
+            if exc.response['Error']['Code'] != 'ResourceNotFoundException':
+                raise
+            print(f"    [Skipped] {target['name']}: Lambda function not found")
 
-    return {'gateway_id': gateway_id, 'gateway_url': gateway_url, 'status': 'CREATING'}
+    if not available:
+        return {'status': 'SKIPPED', 'reason': 'No configured Lambda tool functions are available.'}
+
+    agentcore_ctrl = boto3.client('bedrock-agentcore-control',
+                                   region_name=config.AWS_REGION)
+
+    try:
+        gw_uuid = _gw_stack_uuid()
+    except Exception:
+        gw_uuid = config.PROJECT_NAME
+
+    gw_name = f"novamart-support-{gw_uuid}"
+    print(f"  Calling create_gateway (name: {gw_name})...")
+    gateway_id, gateway_url = _gw_get_or_create(
+        agentcore_ctrl, gw_name, config.AGENTCORE_ROLE_ARN,
+        "NovaMart customer support gateway. Provides order lookup, "
+        "policy search, and customer tier tools.",
+    )
+
+    print(f"\n  Registering {len(available)} Gateway targets...")
+    for target, lambda_arn in available:
+        _gw_create_target(agentcore_ctrl, gateway_id, target, lambda_arn)
+
+    return {'gateway_id': gateway_id, 'gateway_url': gateway_url,
+            'status': 'TARGETS_SUBMITTED', 'target_count': len(available)}
 
 
 
@@ -1174,6 +1128,10 @@ def deploy_all():
     print("  Deploying Enterprise Multi-Agent System")
     print("="*60 + "\n")
 
+    # Fail fast if the AgentCore CLI (used by Steps 3 and 5) is missing.
+    import agentcore_cli
+    print(f"AgentCore CLI: {agentcore_cli.cli_version()} ({agentcore_cli.cli_path()})\n")
+
     print("Step 1/6: Building agent graph...")
     inventory_agent     = build_inventory_agent()
     refund_agent        = build_refund_agent()
@@ -1203,10 +1161,13 @@ def deploy_all():
     print("Step 6/6: Deploying AgentCore Gateway...")
     try:
         gw = deploy_agentcore_gateway()
-        print(f"  Gateway URL : {gw['gateway_url']}")
-        print(f"  Agents connect via MCP at this endpoint — no code changes needed")
+        if gw['status'] == 'SKIPPED':
+            print(f"  [Skipped] Gateway: {gw['reason']}")
+        else:
+            print(f"  Gateway URL : {gw['gateway_url']}")
+            print("  Lambda targets submitted; connect an MCP client separately to use them.")
     except Exception as e:
-        print(f"  [Note] Gateway deployment skipped: {e}")
+        print(f"  [Note] Optional Gateway deployment failed: {e}")
         print(f"  (Deploy Lambda tool functions and set ORDERS_FUNCTION etc. in .env to enable)")
     print()
 
@@ -1218,7 +1179,9 @@ def deploy_all():
     print(f"  GUARDRAIL_ID={guardrail_id}")
     print(f"  GUARDRAIL_VERSION={guardrail_version}\n")
     print(f"  Then try the deployed runtime:")
-    print(f"  python src/agent_orchestrator.py invoke \"What is the return policy for premium customers?\"\n")
+    print(f"  python src/agent_orchestrator.py invoke \"What is the return policy for premium customers?\"")
+    print(f"  or with the CLI:  agentcore invoke \"What is the return policy for premium customers?\"")
+    print(f"  (agentcore status / agentcore logs show the deployed runtime and its logs)\n")
     return runtime_arn, guardrail_id
 
 

@@ -34,8 +34,9 @@ It makes the multi-agent call chain visible in AWS:
          policy, and sets the trace indexing percentage from
          xRayConfig.samplingRate
        - AgentCore Runtime: stores the log group / log level / tracing flags
-         as runtime environment variables so the deployed agent logs and
-         traces exactly as configured
+         as runtime environment variables (declared in agentcore/agentcore.json
+         and applied with `agentcore deploy` via agentcore_cli.py) so the
+         deployed agent logs and traces exactly as configured
      tests/test_agent.py task6 reads that state back from AWS.
 
 Nothing in this module fabricates a response: if an AWS call fails the
@@ -650,6 +651,10 @@ def apply_observability_config(runtime_arn: str, logging_configuration: dict) ->
       xRayConfig       -> CloudWatch Transaction Search + indexing percentage,
                           runtime env: AGENT_TRACING_ENABLED, AGENT_TRACE_SAMPLING_RATE
 
+    The runtime environment variables are written to agentcore/agentcore.json
+    and applied with the AgentCore CLI (`agentcore deploy -y`) - the runtime
+    is CDK-managed by the CLI, so it is never changed behind the CLI's back.
+
     Returns a summary dict. Raises on failure - nothing is faked.
     """
     validate_logging_configuration(logging_configuration)
@@ -669,11 +674,13 @@ def apply_observability_config(runtime_arn: str, logging_configuration: dict) ->
     if xr['enabled']:
         summary['xray'] = enable_transaction_search(float(xr['samplingRate']))
 
-    # 3. Runtime environment variables
+    # 3. Runtime environment variables - declared in agentcore/agentcore.json
+    #    and applied by the AgentCore CLI (`agentcore deploy -y`), so the
+    #    deployed runtime always matches the project configuration.
+    import agentcore_cli
     agentcore_control = boto3.client('bedrock-agentcore-control', region_name=config.AWS_REGION)
     runtime_id = runtime_arn.split('/')[-1]
-    current = agentcore_control.get_agent_runtime(agentRuntimeId=runtime_id)
-    env = dict(current.get('environmentVariables') or {})
+    env = {}
     # Refresh Knowledge Base IDs when re-running deploy after the KBs are created.
     for key in ('RETURNS_KB_ID', 'SHIPPING_KB_ID', 'WARRANTY_KB_ID'):
         value = getattr(config, key, '')
@@ -686,21 +693,13 @@ def apply_observability_config(runtime_arn: str, logging_configuration: dict) ->
         ENV_TRACING_ENABLED:   'true' if xr['enabled'] else 'false',
         ENV_SAMPLING_RATE:     str(float(xr['samplingRate'])),
     })
-    update_kwargs = {
-        'agentRuntimeId':       runtime_id,
-        'agentRuntimeArtifact': current['agentRuntimeArtifact'],
-        'roleArn':              current['roleArn'],
-        'networkConfiguration': current['networkConfiguration'],
-        'environmentVariables': env,
-    }
-    for key in ('description', 'protocolConfiguration', 'lifecycleConfiguration',
-                'authorizerConfiguration', 'requestHeaderConfiguration'):
-        if current.get(key):
-            update_kwargs[key] = current[key]
-    agentcore_control.update_agent_runtime(**update_kwargs)
-    print("  Runtime environment updated - waiting for READY", end='', flush=True)
+    agentcore_cli.configure_runtime(env_vars=env)
+    print("  Runtime environment written to agentcore/agentcore.json - applying with the AgentCore CLI")
+    agentcore_cli.deploy()
+    print("  Waiting for runtime status READY", end='', flush=True)
     wait_for_runtime_ready(agentcore_control, runtime_id)
     print(' ready.')
+    env = agentcore_cli.runtime_env_vars()
     summary['runtime_env'] = {k: env[k] for k in (ENV_LOG_GROUP, ENV_LOG_LEVEL, ENV_LOG_TO_CLOUDWATCH,
                                                  ENV_TRACING_ENABLED, ENV_SAMPLING_RATE)}
     return summary

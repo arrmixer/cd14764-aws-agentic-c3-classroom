@@ -4,7 +4,9 @@ Build a multi-agent customer service system using Amazon Bedrock and AgentCore. 
 
 ## Getting Started
 
-Refer to the project instructions in the Udacity classroom for setup and implementation details.
+Use the [student starter and setup guide](starter/README.md) alongside the Udacity classroom instructions. Runtime deployment uses **AgentCore CLI 0.30.0**; policy retrieval uses **S3 Vectors**.
+
+Complete the TODOs in `starter/src/agent_orchestrator.py`. Implement Tasks 2–6 and create/sync the three Knowledge Bases before the full deployment. The optional Lambda-backed gateway is not required. The starter includes scaffolding and tests, not completed exercise solutions.
 
 ## License
 
